@@ -3,9 +3,14 @@ from threading import Lock
 
 app = Flask(__name__)
 
+# Live accumulation
 seq_to_instr = {}
-final_instructions = None   # persistent final ordered sequence
-final_count = None          # persistent final count
+
+# Frozen, persistent results after finalization
+final_instructions = None   # list[str] once frozen
+final_count = None          # int once frozen
+finalized = False           # True after terminator finalizes the run
+
 store_lock = Lock()
 
 def repeating_unit_length(s: str) -> int:
@@ -25,7 +30,7 @@ def repeating_unit_length(s: str) -> int:
 
 @app.route("/instruction", methods=["POST"])
 def instruction():
-    global final_instructions, final_count
+    global final_instructions, final_count, finalized
 
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
@@ -33,6 +38,7 @@ def instruction():
 
     if "seq" not in data or "instruction" not in data:
         return jsonify({"error": "JSON must include 'seq' and 'instruction'"}), 400
+
     try:
         seq = int(data["seq"])
     except (ValueError, TypeError):
@@ -43,39 +49,42 @@ def instruction():
         return jsonify({"error": "'instruction' must be a string"}), 400
 
     with store_lock:
+        if finalized:
+            # Ignore any further writes after we’ve frozen the result.
+            return jsonify({"status": "ignored", "reason": "sequence finalized"}), 409
+
+        # Upsert the step
         seq_to_instr[seq] = instr
 
-        # Not the terminator, just ack
+        # If not the terminator, just acknowledge
         if instr != "":
             return jsonify({"status": "accepted", "seq": seq}), 202
 
-        # Terminator received → finalize if complete
+        # Terminator received → check completeness for steps 1..(seq-1)
         final_seq = seq
         ordered = [seq_to_instr.get(i, "") for i in range(1, final_seq)]
         missing = [i for i, v in enumerate(ordered, start=1) if v == ""]
 
         if missing:
+            # Don’t freeze; allow more steps to arrive
             return jsonify({
                 "status": "incomplete",
                 "final_seq": final_seq,
                 "missing_count": len(missing),
                 "missing_first_10": missing[:10],
-                "message_length": sum(len(x) for x in ordered),
             }), 409
 
-        # Persist final values
-        final_instructions = ordered.copy()
-        final_count = len(final_instructions)
+        # Freeze results permanently
+        final_instructions = ordered
+        final_count = len(ordered)
+        finalized = True
 
-        # Optionally compute repeating length (unchanged)
+        # Optional: compute repeating length (kept for your visibility)
         message = "".join(ordered)
         base_len = repeating_unit_length(message)
 
-        # Clear live buffer for the next run (keeps the persisted finals)
-        seq_to_instr.clear()
-
         return jsonify({
-            "status": "complete",
+            "status": "finalized",
             "final_seq": final_seq,
             "steps_counted": final_count,
             "message_length": len(message),
@@ -84,42 +93,36 @@ def instruction():
 
 @app.route("/count", methods=["GET"])
 def count_instructions():
-    """
-    Returns instruction count.
-    - Default: persistent final count if available (status=final).
-    - Use ?current=true to force current in-progress count (status=in-progress).
-    """
-    current = request.args.get("current", "false").lower() == "true"
     with store_lock:
-        if not current and final_count is not None:
+        if finalized:
             return jsonify({"instruction_count": final_count, "status": "final"}), 200
-
-        # Count live, non-empty instructions in the current run
-        live_count = sum(1 for instr in seq_to_instr.values() if instr != "")
+        # Live (pre-finalization) count excludes any empty strings
+        live_count = sum(1 for v in seq_to_instr.values() if v != "")
         return jsonify({"instruction_count": live_count, "status": "in-progress"}), 200
 
 @app.route("/instructions", methods=["GET"])
 def list_instructions():
     """
-    Returns ordered instructions.
-    - If finalized, returns the persisted final set: status=final
-    - Otherwise, returns current in-progress view with missing indices
-    - Add ?concat=true to include the concatenated message string
+    Returns instructions in order.
+    - After finalization: persistent frozen list
+    - Before finalization: current view with missing indices
+    Query param: ?concat=true to include concatenated message
     """
     concat = request.args.get("concat", "false").lower() == "true"
 
     with store_lock:
-        if final_instructions is not None:
+        if finalized:
             resp = {
                 "instructions": final_instructions,
-                "status": "final"
+                "status": "final",
+                "count": final_count
             }
             if concat:
                 resp["message"] = "".join(final_instructions)
             return jsonify(resp), 200
 
         if not seq_to_instr:
-            return jsonify({"instructions": [], "status": "in-progress"}), 200
+            return jsonify({"instructions": [], "status": "in-progress", "count": 0}), 200
 
         end = max(seq_to_instr.keys())
         ordered = [seq_to_instr.get(i, "") for i in range(1, end + 1)]
@@ -127,12 +130,24 @@ def list_instructions():
         resp = {
             "instructions": ordered,
             "status": "in-progress",
+            "count": sum(1 for v in ordered if v != ""),
             "missing": missing,
-            "missing_count": len(missing)
+            "missing_count": len(missing),
         }
         if concat:
             resp["message"] = "".join(ordered)
         return jsonify(resp), 200
+
+# Optional: explicit reset to start a brand-new run
+@app.route("/reset", methods=["POST"])
+def reset():
+    global seq_to_instr, final_instructions, final_count, finalized
+    with store_lock:
+        seq_to_instr = {}
+        final_instructions = None
+        final_count = None
+        finalized = False
+    return jsonify({"status": "reset"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
