@@ -1,6 +1,12 @@
 from flask import Flask, request, jsonify
 from threading import Lock
+import re
+import requests
 
+OWNER_MANUAL_URL = (
+    "https://gitea-gitea.apps.cluster-vwppf.vwppf.sandbox2632.opentlc.com/"
+    "starter/INSTRUCTIONS/raw/branch/master/resources/quantumpulse-3000.md"
+)
 app = Flask(__name__)
 
 # Live accumulation
@@ -148,6 +154,65 @@ def reset():
         final_count = None
         finalized = False
     return jsonify({"status": "reset"}), 200
+
+from flask import request, jsonify
+
+@app.route("/chunks", methods=["GET"])
+def chunks():
+    """
+    Reads the markdown Owner's Manual and splits it into fixed-size chunks.
+    A 'paragraph' is any fragment of text separated by a blank line.
+    Each chunk has 8 paragraphs; the final chunk may be smaller.
+    Returns only the count of chunks (and some metadata).
+
+    Optional query params:
+      - url: override the manual URL (defaults to OWNER_MANUAL_URL)
+      - size: override chunk size (defaults to 8)
+    """
+    url = request.args.get("url", OWNER_MANUAL_URL)
+    try:
+        chunk_size = int(request.args.get("size", "8"))
+        if chunk_size <= 0:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "size must be a positive integer"}), 400
+
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        text = resp.text
+    except requests.RequestException as e:
+        return jsonify({
+            "error": "failed to fetch manual",
+            "details": str(e),
+            "url": url
+        }), 502
+
+    # Normalize newlines and trim
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not text:
+        return jsonify({
+            "url": url,
+            "paragraphs": 0,
+            "chunk_size": chunk_size,
+            "chunks": 0
+        }), 200
+
+    # Split on one or more blank lines; treat whitespace-only lines as blank
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    para_count = len(paragraphs)
+
+    # Count chunks of size `chunk_size` (last may be partial)
+    chunks_count = (para_count + chunk_size - 1) // chunk_size
+
+    return jsonify({
+        "url": url,
+        "paragraphs": para_count,
+        "chunk_size": chunk_size,
+        "chunks": chunks_count
+    }), 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
