@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, request, jsonify
 from threading import Lock
 
@@ -41,23 +42,24 @@ def instruction():
     with store_lock:
         seq_to_instr[seq] = instr
 
+        # If terminator not received, just accept
         if instr != "":
             return jsonify({"status": "accepted", "seq": seq}), 202
 
+        # Terminator received → compute result if complete
         final_seq = seq
         ordered = [seq_to_instr.get(i, "") for i in range(1, final_seq)]
         missing = [i for i, v in enumerate(ordered, start=1) if v == ""]
         message = "".join(ordered)
 
         if missing:
-            result = {
+            return jsonify({
                 "status": "incomplete",
                 "final_seq": final_seq,
                 "missing_count": len(missing),
                 "missing_first_10": missing[:10],
                 "message_length": len(message),
-            }
-            return jsonify(result), 409
+            }), 409
 
         base_len = repeating_unit_length(message)
         result = {
@@ -68,15 +70,52 @@ def instruction():
             "repeating_unit_length": base_len,
         }
 
+        # Reset for next run
         seq_to_instr.clear()
         return jsonify(result), 200
 
 @app.route("/count", methods=["GET"])
 def count_instructions():
     with store_lock:
-        # Count only non-empty instructions (exclude the terminator if received early)
         count = sum(1 for instr in seq_to_instr.values() if instr != "")
     return jsonify({"instruction_count": count}), 200
+
+@app.route("/instructions", methods=["GET"])
+def list_instructions():
+    """
+    Returns all instructions in order.
+    - If a terminator "" was received, returns steps 1..(terminator_seq-1)
+    - Otherwise returns steps 1..max_seq_seen (missing steps reported)
+    """
+    with store_lock:
+        if not seq_to_instr:
+            return jsonify({
+                "instructions": [],
+                "final_seq_basis": None,
+                "missing": [],
+                "missing_count": 0
+            }), 200
+
+        # Determine end of sequence
+        terminators = [s for s, v in seq_to_instr.items() if v == ""]
+        if terminators:
+            end = max(terminators) - 1  # exclude terminator
+            basis = "terminator"
+        else:
+            end = max(seq_to_instr.keys())
+            basis = "max_seen"
+
+        # Build ordered list and detect missing
+        ordered = [seq_to_instr.get(i, "") for i in range(1, end + 1)]
+        missing = [i for i, v in enumerate(ordered, start=1) if v == ""]
+
+        return jsonify({
+            "instructions": ordered,              # in order
+            "final_seq_basis": basis,            # "terminator" or "max_seen"
+            "end_seq": end,
+            "missing": missing,
+            "missing_count": len(missing)
+        }), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
