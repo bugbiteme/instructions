@@ -1,10 +1,11 @@
-# app.py
 from flask import Flask, request, jsonify
 from threading import Lock
 
 app = Flask(__name__)
 
 seq_to_instr = {}
+final_instructions = None   # persistent final ordered sequence
+final_count = None          # persistent final count
 store_lock = Lock()
 
 def repeating_unit_length(s: str) -> int:
@@ -24,6 +25,8 @@ def repeating_unit_length(s: str) -> int:
 
 @app.route("/instruction", methods=["POST"])
 def instruction():
+    global final_instructions, final_count
+
     if not request.is_json:
         return jsonify({"error": "Request must be JSON"}), 400
     data = request.get_json()
@@ -42,15 +45,14 @@ def instruction():
     with store_lock:
         seq_to_instr[seq] = instr
 
-        # If terminator not received, just accept
+        # Not the terminator, just ack
         if instr != "":
             return jsonify({"status": "accepted", "seq": seq}), 202
 
-        # Terminator received → compute result if complete
+        # Terminator received → finalize if complete
         final_seq = seq
         ordered = [seq_to_instr.get(i, "") for i in range(1, final_seq)]
         missing = [i for i, v in enumerate(ordered, start=1) if v == ""]
-        message = "".join(ordered)
 
         if missing:
             return jsonify({
@@ -58,64 +60,79 @@ def instruction():
                 "final_seq": final_seq,
                 "missing_count": len(missing),
                 "missing_first_10": missing[:10],
-                "message_length": len(message),
+                "message_length": sum(len(x) for x in ordered),
             }), 409
 
+        # Persist final values
+        final_instructions = ordered.copy()
+        final_count = len(final_instructions)
+
+        # Optionally compute repeating length (unchanged)
+        message = "".join(ordered)
         base_len = repeating_unit_length(message)
-        result = {
+
+        # Clear live buffer for the next run (keeps the persisted finals)
+        seq_to_instr.clear()
+
+        return jsonify({
             "status": "complete",
             "final_seq": final_seq,
-            "steps_counted": final_seq - 1,
+            "steps_counted": final_count,
             "message_length": len(message),
-            "repeating_unit_length": base_len,
-        }
-
-        # Reset for next run
-        seq_to_instr.clear()
-        return jsonify(result), 200
+            "repeating_unit_length": base_len
+        }), 200
 
 @app.route("/count", methods=["GET"])
 def count_instructions():
+    """
+    Returns instruction count.
+    - Default: persistent final count if available (status=final).
+    - Use ?current=true to force current in-progress count (status=in-progress).
+    """
+    current = request.args.get("current", "false").lower() == "true"
     with store_lock:
-        count = sum(1 for instr in seq_to_instr.values() if instr != "")
-    return jsonify({"instruction_count": count}), 200
+        if not current and final_count is not None:
+            return jsonify({"instruction_count": final_count, "status": "final"}), 200
+
+        # Count live, non-empty instructions in the current run
+        live_count = sum(1 for instr in seq_to_instr.values() if instr != "")
+        return jsonify({"instruction_count": live_count, "status": "in-progress"}), 200
 
 @app.route("/instructions", methods=["GET"])
 def list_instructions():
     """
-    Returns all instructions in order.
-    - If a terminator "" was received, returns steps 1..(terminator_seq-1)
-    - Otherwise returns steps 1..max_seq_seen (missing steps reported)
+    Returns ordered instructions.
+    - If finalized, returns the persisted final set: status=final
+    - Otherwise, returns current in-progress view with missing indices
+    - Add ?concat=true to include the concatenated message string
     """
+    concat = request.args.get("concat", "false").lower() == "true"
+
     with store_lock:
+        if final_instructions is not None:
+            resp = {
+                "instructions": final_instructions,
+                "status": "final"
+            }
+            if concat:
+                resp["message"] = "".join(final_instructions)
+            return jsonify(resp), 200
+
         if not seq_to_instr:
-            return jsonify({
-                "instructions": [],
-                "final_seq_basis": None,
-                "missing": [],
-                "missing_count": 0
-            }), 200
+            return jsonify({"instructions": [], "status": "in-progress"}), 200
 
-        # Determine end of sequence
-        terminators = [s for s, v in seq_to_instr.items() if v == ""]
-        if terminators:
-            end = max(terminators) - 1  # exclude terminator
-            basis = "terminator"
-        else:
-            end = max(seq_to_instr.keys())
-            basis = "max_seen"
-
-        # Build ordered list and detect missing
+        end = max(seq_to_instr.keys())
         ordered = [seq_to_instr.get(i, "") for i in range(1, end + 1)]
         missing = [i for i, v in enumerate(ordered, start=1) if v == ""]
-
-        return jsonify({
-            "instructions": ordered,              # in order
-            "final_seq_basis": basis,            # "terminator" or "max_seen"
-            "end_seq": end,
+        resp = {
+            "instructions": ordered,
+            "status": "in-progress",
             "missing": missing,
             "missing_count": len(missing)
-        }), 200
+        }
+        if concat:
+            resp["message"] = "".join(ordered)
+        return jsonify(resp), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
