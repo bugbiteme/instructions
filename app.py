@@ -162,8 +162,7 @@ def chunks():
     """
     Reads the markdown Owner's Manual and splits it into fixed-size chunks.
     A 'paragraph' is any fragment of text separated by a blank line.
-    Each chunk has 8 paragraphs; the final chunk may be smaller.
-    Returns only the count of chunks (and some metadata).
+    Each chunk has `size` paragraphs (default 8); the final chunk may be smaller.
 
     Optional query params:
       - url: override the manual URL (defaults to OWNER_MANUAL_URL)
@@ -191,27 +190,40 @@ def chunks():
     # Normalize newlines and trim
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
+    # If empty, return an empty set of chunks
     if not text:
         return jsonify({
             "url": url,
-            "paragraphs": 0,
+            "paragraph_count": 0,
             "chunk_size": chunk_size,
-            "chunks": 0
+            "chunks_count": 0,
+            "chunks": []
         }), 200
 
     # Split on one or more blank lines; treat whitespace-only lines as blank
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
     para_count = len(paragraphs)
 
-    # Count chunks of size `chunk_size` (last may be partial)
-    chunks_count = (para_count + chunk_size - 1) // chunk_size
+    # Build the actual chunks
+    chunks_list = []
+    for i in range(0, para_count, chunk_size):
+        chunk_paras = paragraphs[i:i + chunk_size]
+        chunks_list.append({
+            "index": (i // chunk_size) + 1,           # 1-based index
+            "start_paragraph": i + 1,                  # 1-based paragraph start
+            "end_paragraph": i + len(chunk_paras),     # 1-based paragraph end
+            "size": len(chunk_paras),
+            "paragraphs": chunk_paras
+        })
 
     return jsonify({
         "url": url,
-        "paragraphs": para_count,
+        "paragraph_count": para_count,
         "chunk_size": chunk_size,
-        "chunks": chunks_count
+        "chunks_count": len(chunks_list),
+        "chunks": chunks_list
     }), 200
+
 
 
 if __name__ == "__main__":
